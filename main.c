@@ -14,6 +14,8 @@
 #include <dc/flashrom.h>
 
 #define READ_BLOCK_SIZE 2048 // TODO: optimize this if needed
+#define SD_MOUNT_POINT "/sd"
+#define MAX_PATH 64
 
 #define ERRMSG_SD_INIT "Could not initialize the SD card. Please make sure that you have an SD card adapter plugged in and an SD card inserted.\n"
 #define ERRMSG_SD_NO_PART "Could not find the first partition on the SD card\n"
@@ -21,13 +23,16 @@
 #define ERRMSG_SD_EXT2_INIT "Could not initialize fs_ext2\n"
 #define ERRMSG_SD_MOUNT "Could not mount SD card as ext2fs. Please make sure the card has been properly formatted.\n"
 
-void exit_fatal(char *message) {
+
+void exit_fatal(char *message)
+{
     printf(message);
     dbgio_printf(message);
     exit(EXIT_FAILURE);
 }
 
-void init_sd_access(kos_blockdev_t *sd_dev, uint8 partition_type) {
+void init_sd_access(kos_blockdev_t *sd_dev, uint8 partition_type)
+{
     // Init SD Subsystem
     if(sd_init())
         exit_fatal(ERRMSG_SD_INIT);
@@ -45,17 +50,32 @@ void init_sd_access(kos_blockdev_t *sd_dev, uint8 partition_type) {
     if(fs_ext2_init())
         exit_fatal(ERRMSG_SD_EXT2_INIT);
 
-    if(fs_ext2_mount("/sd", sd_dev, FS_EXT2_MOUNT_READWRITE))
+    if(fs_ext2_mount(SD_MOUNT_POINT, sd_dev, FS_EXT2_MOUNT_READWRITE))
         exit_fatal(ERRMSG_SD_MOUNT);
 }
 
-int main(int argc, char **argv) {
-    time_t cur_dt = rtc_unix_secs();
+void shutdown_sd_access() {
+    fs_ext2_unmount(SD_MOUNT_POINT);
+    fs_ext2_shutdown();
+    sd_shutdown();
+}
 
+
+int main(int argc, char **argv) 
+{
+    time_t cur_dt = rtc_unix_secs();
     kos_blockdev_t sd_dev;
     uint8 partition_type = 0;
     //struct dirent *entry;
     FILE *fp;
+
+    size_t read_offset = 0;
+    size_t bytes_read = 0;
+    size_t write_offset = 0;
+    size_t bytes_written = 0;
+
+    char buf[READ_BLOCK_SIZE];
+    char filepath[MAX_PATH];
 
     dbgio_init();
     dbgio_enable();
@@ -64,25 +84,23 @@ int main(int argc, char **argv) {
     init_sd_access(&sd_dev, partition_type);
 
     // Open file for writing
-    char filepath[64];
-    sprintf(filepath,"/sd/flash_%lld", cur_dt);
+    snprintf(filepath,MAX_PATH,"%s/flash_%lld", SD_MOUNT_POINT, cur_dt);
 
     if (!(fp = fopen(filepath, "w"))) {
-        printf("Could not create file: %s\n", strerror(errno));
-        dbgio_printf("Could not create file: %s\n", strerror(errno));
-        exit(EXIT_FAILURE);
+        shutdown_sd_access();
+        printf("Could not write to file: %s\n", strerror(errno));
+        dbgio_printf("Could not write to file: %s\n", strerror(errno));
+        exit_fatal("FUCK WE'RE DEAD WE'RE ALL DEAD");
     }
-
-    size_t read_offset = 0;
-    size_t bytes_read = 0;
-    char buf[READ_BLOCK_SIZE];
 
     while ((bytes_read = flashrom_read(read_offset, buf, READ_BLOCK_SIZE)) > -1) {
         read_offset += bytes_read;
-        if (fwrite(buf, sizeof(buf), 1, fp) < 0) {
+        if ((bytes_written = fwrite(buf, sizeof(buf), 1, fp)) < 0) {
             printf("Could not write to file: %s\n", strerror(errno));
             dbgio_printf("Could not write to file: %s\n", strerror(errno));
             break;
+        } else {
+            write_offset += bytes_written;
         }
     }
 
@@ -91,9 +109,7 @@ int main(int argc, char **argv) {
     printf("Dumped flash to %s", filepath);
     dbgio_printf("Dumped flash to %s", filepath);
 
-    fs_ext2_unmount("/sd");
-    fs_ext2_shutdown();
-    sd_shutdown();
-    
+    shutdown_sd_access();
+
     return 0;
 }
