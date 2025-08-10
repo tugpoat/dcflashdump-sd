@@ -1,6 +1,6 @@
-TARGET = flashdump-sd.elf
+TARGET = flashdump-ip.elf
 OBJS = main.o
-CFLAGS =
+CFLAGS = -DDCLOAD_WRITE
 
 all: rm-elf $(TARGET)
 

@@ -10,13 +10,32 @@
 #include <kos/blockdev.h>
 #include <kos/dbgio.h>
 
-#include <dc/sd.h>
 #include <dc/flashrom.h>
 
-#define READ_BLOCK_SIZE 2048 // TODO: optimize this if needed
-#define SD_MOUNT_POINT "/sd"
-#define MAX_PATH 64
+// --- Default to writing to SD
+#ifdef SD_WRITE
+    #undef DCLOAD_WRITE
+#endif
+#ifndef DCLOAD_WRITE
+    #include <dc/sd.h>
+    #define SD_WRITE
+    #define MOUNT_POINT "/sd"
+#else
+    #define MOUNT_POINT "/pc"
+#endif
+// ---
 
+/*
+        https://dreamcast.wiki/Memory_map
+        Use privileged, uncached memory access to copy 0x00200000 to 0x0021FFFF
+        0xA is the flag.
+*/
+#define FLASH_ADDR_START 0xA0200000
+#define FLASH_ADDR_END 0xA021FFFF
+
+#define READ_BLOCK_SIZE 2048 // TODO: optimize this if needed
+
+#define MAX_PATH 64
 #define ERRMSG_SD_INIT "Could not initialize the SD card. Please make sure that you have an SD card adapter plugged in and an SD card inserted.\n"
 #define ERRMSG_SD_NO_PART "Could not find the first partition on the SD card\n"
 #define ERRMSG_SD_INVALID_FS "MBR indicates a non-ext2 filesystem."
@@ -26,11 +45,11 @@
 
 void exit_fatal(char *message)
 {
-    printf(message);
     dbgio_printf(message);
     exit(EXIT_FAILURE);
 }
 
+#ifdef SD_WRITE
 void init_sd_access(kos_blockdev_t *sd_dev, uint8 partition_type)
 {
     // Init SD Subsystem
@@ -50,66 +69,81 @@ void init_sd_access(kos_blockdev_t *sd_dev, uint8 partition_type)
     if(fs_ext2_init())
         exit_fatal(ERRMSG_SD_EXT2_INIT);
 
-    if(fs_ext2_mount(SD_MOUNT_POINT, sd_dev, FS_EXT2_MOUNT_READWRITE))
+    if(fs_ext2_mount(MOUNT_POINT, sd_dev, FS_EXT2_MOUNT_READWRITE))
         exit_fatal(ERRMSG_SD_MOUNT);
 }
 
 void shutdown_sd_access() {
-    fs_ext2_unmount(SD_MOUNT_POINT);
+    fs_ext2_unmount(MOUNT_POINT);
     fs_ext2_shutdown();
     sd_shutdown();
 }
 
+#endif
 
 int main(int argc, char **argv) 
 {
     time_t cur_dt = rtc_unix_secs();
+
+#ifdef SD_WRITE
     kos_blockdev_t sd_dev;
     uint8 partition_type = 0;
-    //struct dirent *entry;
-    FILE *fp;
+#endif
 
-    size_t read_offset = 0;
-    size_t bytes_read = 0;
+    size_t read_offset = FLASH_ADDR_START;
     size_t write_offset = 0;
-    size_t bytes_written = 0;
 
-    char buf[READ_BLOCK_SIZE];
+    uint8 buf[READ_BLOCK_SIZE];
     char filepath[MAX_PATH];
+    FILE *fp;
 
     dbgio_init();
     dbgio_enable();
 
+#ifdef SD_WRITE
     // Init SD subsystem and ext2 access
     init_sd_access(&sd_dev, partition_type);
+#endif
 
     // Open file for writing
-    snprintf(filepath,MAX_PATH,"%s/flash_%lld", SD_MOUNT_POINT, cur_dt);
+    snprintf(filepath,MAX_PATH,"%s/flash_%lld", MOUNT_POINT, cur_dt);
+    dbgio_printf("Opening outfile: %s\n", filepath);
 
-    if (!(fp = fopen(filepath, "w"))) {
+    if ((fp = fopen(filepath, "wb+")) == NULL) {
+        // We couldn't open the file
+#ifdef SD_WRITE
         shutdown_sd_access();
-        printf("Could not write to file: %s\n", strerror(errno));
-        dbgio_printf("Could not write to file: %s\n", strerror(errno));
-        exit_fatal("FUCK WE'RE DEAD WE'RE ALL DEAD");
+#endif
+        dbgio_printf("ERROR: Could not open file for writing: %s\n", strerror(errno));
+        exit_fatal("bye :(");
     }
 
-    while ((bytes_read = flashrom_read(read_offset, buf, READ_BLOCK_SIZE)) > -1) {
-        read_offset += bytes_read;
-        if ((bytes_written = fwrite(buf, sizeof(buf), 1, fp)) < 0) {
-            printf("Could not write to file: %s\n", strerror(errno));
-            dbgio_printf("Could not write to file: %s\n", strerror(errno));
+    /*
+        Read from flash in chunks of READ_BLOCK_SIZE,
+        then immediately write each chunk to the destination file
+    */
+    while (memcpy(&buf, (void *)read_offset, READ_BLOCK_SIZE) != NULL && (read_offset <= FLASH_ADDR_END))
+    {
+        if (fwrite(buf, sizeof(buf), 1, fp) < 0) {
+            dbgio_printf("ERROR: Could not write to file: %s\n", strerror(errno));
             break;
         } else {
-            write_offset += bytes_written;
+            write_offset += READ_BLOCK_SIZE;
         }
+        dbgio_printf("0x%0X - 0x%0X dumped, bytes written:%d\n", read_offset, (read_offset + READ_BLOCK_SIZE), write_offset);
+        read_offset += READ_BLOCK_SIZE;
     }
 
+    /*
+        Clean up and exit
+    */
     fclose(fp);
 
-    printf("Dumped flash to %s", filepath);
-    dbgio_printf("Dumped flash to %s", filepath);
+    dbgio_printf("Dumped %d bytes to %s", write_offset, filepath);
 
+#ifdef SD_WRITE
     shutdown_sd_access();
+#endif
 
     return 0;
 }
